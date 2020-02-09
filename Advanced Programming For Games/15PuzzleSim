@@ -1,0 +1,735 @@
+/*
+Author: Eleanor Gregory
+Date: Oct 2019
+
+Entry point for the 15 puzzle simulation. 
+
+/ᐠ .ᆺ. ᐟ\ﾉ
+
+*/
+#include <iostream>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <algorithm>
+#include <random>
+#include <chrono>
+#include <numeric>
+#include <thread>
+#include <regex>
+
+#include "ctpl_stl.h"
+#include "Puzzle.h"
+#include "FileHandler.h"
+#include "BigInt.h"
+#include "StatStructs.h"
+
+FileHandler fifteen_file;
+FileHandler solution_file;
+regex puzzle_tab_regex("([0-9]+\t*)+");
+regex puzzle_space_regex("([0-9]+\s*)+");
+auto rng = std::default_random_engine{};
+
+const int LARGEST_FACTORIAL = 70 * 70;
+
+ostringstream buf;
+mutex bufMutex;
+
+/* HELPER FUNCTIONS */
+
+// Approximate the factorial should it be too large.
+unsigned long long stirlingFactorial(int n)
+{
+	if (n == 1)
+		return 1;
+	unsigned long long  z;
+	float e = 2.71; 
+
+	z = sqrt(2 * 3.14 * n) * pow((n / e), n);
+	return z;
+}
+
+
+bigint large_factorial(int n)
+{
+	if ((n == 0) || (n == 1))
+		return 1;
+	else
+		return large_factorial(n - 1) * n;
+}
+
+unsigned long long small_factorial(int n) {
+	if ((n == 0) || (n == 1))
+		return 1;
+	else
+		return small_factorial(n - 1) * n;
+}
+
+void validate_is_int(int& location, string message)
+{
+	bool valid = false;
+	while (!valid)
+	{
+		cout << message;
+		cin >> location;
+		if (location > 1 && !cin.fail())
+			valid = true;
+		else
+		{
+			cout << "Must enter a positive integer!\n";
+			cin.clear();
+			cin.ignore(256, '\n');
+		}
+	}
+}
+
+void validate_file_name(string& name, string message)
+{
+	bool valid = false;
+	while (!valid)
+	{
+		cout << message;
+		cin >> name;
+		if (name.find_first_of("<>:\"/\|?*") == string::npos)
+			valid = true;
+		else
+		{
+			cout << "Invalid file name character entered\n";
+			cin.clear();
+			cin.ignore(256, '\n');
+		}
+	}
+
+}
+
+void set_file_names()
+{
+	string fifteenName;
+	validate_file_name(fifteenName, "Enter the name of the file to use as the 15-file: ");
+
+	string solutionName;
+	validate_file_name(solutionName, "Enter the name of the file to use as the solution file: ");
+
+	if (fifteenName.find('.') == string::npos)
+		fifteenName += ".txt";
+
+	if (solutionName.find('.') == string::npos)
+		solutionName += ".txt";
+
+	fifteen_file.set_file_name(fifteenName);
+	solution_file.set_file_name(solutionName);
+}
+
+void validate_line_format(string line) throw (invalid_argument)
+{
+	if (line != "" && !regex_search(line, puzzle_tab_regex) && !regex_search(line, puzzle_space_regex))
+		throw invalid_argument("Data in 15 file does not match correct format");
+}
+
+/* CONTINUOUS SET OF NUMBER CHECKERS */
+
+bool check_cont(int* puzzleBlocks, int size)
+{
+	bool continous = true;
+	int continousCompare = puzzleBlocks[0];
+	if (continousCompare == Puzzle::BLANK)
+		return false;
+
+	for (int i = 1; i < size; i++)
+	{
+		continousCompare++;
+		if (puzzleBlocks[i] != continousCompare)
+		{
+			continous = false;
+			break;
+		}
+	}
+
+	return continous;
+}
+
+bool check_rev_cont(int* puzzleBlocks, int size)
+{
+	if (puzzleBlocks[0] == Puzzle::BLANK)
+		return false;
+
+	bool continous = true;
+	int continousCompare = puzzleBlocks[size-1];
+
+	for (int i = size - 2; i >= 0; i--)
+	{
+		continousCompare--;
+		if (puzzleBlocks[i] != continousCompare)
+		{
+			continous = false;
+			break;
+		}
+	}
+	return continous;
+}
+
+// If puzzle is input in a format where the reverse rows must be checked as they are (no sorting, position checking)
+// This will ensure the blocks are entered in the correct format.
+bool check_rev_cont_flipped(int* puzzleBlocks, int size)
+{
+	int* blocks = new int[size];
+	copy(puzzleBlocks, puzzleBlocks + size, blocks);
+	reverse(blocks, blocks + size);
+
+	if (blocks[0] == Puzzle::BLANK)
+		return false;
+
+	bool continous = true;
+	int continousCompare = blocks[size - 1];
+
+	for (int i = size - 2; i >= 0; i--)
+	{
+		continousCompare--;
+		if (blocks[i] != continousCompare)
+		{
+			continous = false;
+			break;
+		}
+	}
+
+	delete[] blocks;
+	return continous;
+}
+
+// Checking if the given blocks are on the same rows and columns based on a 1D array representation.
+bool same_row_check(vector<int> indexes, int puzzleSize)
+{
+	if (indexes.back() >= (puzzleSize * puzzleSize) - 1)
+		return false;
+
+	for (int i = 0; i < indexes.size(); i++)
+	{
+		if (i > 0 && indexes.at(i) % puzzleSize == 0)
+			return false;
+	}
+
+	return true;
+}
+
+bool same_column_check(vector<int> indexes, int puzzleSize)
+{
+	if (indexes.back() >= (puzzleSize * puzzleSize) - 1)
+		return false;
+
+	for (int i = 1; i < indexes.size(); i++)
+	{
+		if (i > 0 && ((indexes.at(i) - indexes.at(i - 1)) != puzzleSize))
+			return false;
+	}
+
+	return true;
+}
+
+/* CONTINOUS ROW/COLUMN FINDERS */
+// If the continous set of numbers is fixed in one position (e.g. the top row), calculate the number of configurations with that set in that position.
+// Divide by 2 as only half the configurations are ever reachable.
+// Multiple the continous row/col results from this by the remaining number of rows the number set can fit on.
+
+PuzzleStatsLarge cont_finder_large(Puzzle& p, int partialSize)
+{
+	int* blocks = new int[p.get_no_of_blocks()];
+	copy(p.get_all_blocks(), p.get_all_blocks() + p.get_no_of_blocks(), blocks);
+	sort(blocks, blocks + p.get_no_of_blocks());
+
+	PuzzleStatsLarge stats = { 0 };
+	int factorialToCalculate = p.get_no_of_blocks() - partialSize - 1;
+	bigint remainingBlockPositions;
+	if (factorialToCalculate >= LARGEST_FACTORIAL)
+	{
+		cout << "Puzzle size too large for factorial calculation! Results will be approximated.";
+		unsigned long long approx = stirlingFactorial(factorialToCalculate);
+		remainingBlockPositions = (bigint)(to_string(approx)) / 2;
+	}
+	else
+		remainingBlockPositions = large_factorial(factorialToCalculate) / 2;
+
+	for (int setCount = 0; setCount < p.get_no_of_blocks(); setCount++)
+	{
+		if (check_cont(&blocks[setCount], partialSize))
+		{
+			stats.contRows += remainingBlockPositions;
+			stats.contCols = stats.contRows;
+		}
+
+		if (check_rev_cont(&blocks[setCount], partialSize))
+		{
+			stats.revContRows += remainingBlockPositions;
+			stats.revContCols = stats.revContRows;
+		}
+	}
+
+	int remainingPossiblePositions = (p.get_puzzle_size() - 1) + (p.get_puzzle_size() * (p.get_puzzle_size() - partialSize));
+
+	stats *= remainingPossiblePositions;
+
+	delete[] blocks;
+	return stats;
+}
+
+PuzzleStats cont_finder(Puzzle& p, int partialSize)
+{
+	int* blocks = new int[p.get_no_of_blocks()];
+	copy(p.get_all_blocks(), p.get_all_blocks() + p.get_no_of_blocks(), blocks);
+	sort(blocks, blocks + p.get_no_of_blocks());
+	PuzzleStats stats = { 0 };
+
+	for (int setCount = 0; setCount < p.get_no_of_blocks(); setCount++)
+	{
+		unsigned long long remainingBlockPositions = small_factorial((p.get_no_of_blocks() - partialSize - 1)) / 2;
+		if (check_cont(&blocks[setCount], partialSize))
+		{
+			stats.contRows += remainingBlockPositions;
+			stats.contCols = stats.contRows;
+		}
+
+		if (check_rev_cont(&blocks[setCount], partialSize))
+		{
+			stats.revContRows += remainingBlockPositions;
+			stats.revContCols = stats.revContRows;
+		}
+	}
+
+	int remainingPossiblePositions = (p.get_puzzle_size() - 1) + (p.get_puzzle_size() * (p.get_puzzle_size() - partialSize));
+
+	stats *= remainingPossiblePositions;
+
+	delete[] blocks;
+	return stats;
+}
+
+// Function based on the indexes of the block values in their array representation to determine continous sets.
+void conts_for_single_config(Puzzle& p, int partialLength, int* partialField)
+{
+	int* blocks = new int[p.get_no_of_blocks()];
+	copy(p.get_all_blocks(), p.get_all_blocks() + p.get_no_of_blocks(), blocks);
+	int total = 0;
+	vector<int> currentIndexes(partialLength);
+	
+	for (int setCount = 0; setCount < p.get_no_of_blocks(); setCount++)
+	{
+		for (int i = 0; i < currentIndexes.size(); i++)
+			currentIndexes[i] = setCount + i;
+
+		if (same_row_check(currentIndexes, p.get_puzzle_size()))
+		{
+			if (check_cont(&blocks[setCount], partialLength) || check_rev_cont_flipped(&blocks[setCount], partialLength))
+			{
+				(*partialField)++;
+			}
+		}
+
+		int beginIndex = setCount;
+		currentIndexes.at(0) = beginIndex;
+		generate(currentIndexes.begin()+1, currentIndexes.end(), [&]() { return beginIndex += p.get_puzzle_size(); });
+		if (same_column_check(currentIndexes, p.get_puzzle_size()))
+		{
+			vector<int> colBlocks;
+			for (int i = 0; i < currentIndexes.size(); i++)
+				colBlocks.push_back(blocks[currentIndexes.at(i)]);
+
+			if (check_cont(&colBlocks[0], partialLength) || check_rev_cont_flipped(&colBlocks[0], partialLength))
+			{
+				(*partialField)++;
+			}
+		}
+	}
+}
+
+PartialStatsLarge partial_finder_large(Puzzle& p)
+{
+	PartialStatsLarge stats = { 0 };
+	PuzzleStatsLarge results = { 0 };
+	int puzzleDimension = p.get_puzzle_size();
+
+	if (puzzleDimension >= 2)
+	{
+		conts_for_single_config(p, 2, &stats.twos);
+		results = cont_finder_large(p, 2);
+		stats.totalTwos = results.sum();
+	}
+
+	if (puzzleDimension >= 3)
+	{
+		conts_for_single_config(p, 3, &stats.threes);
+		results = cont_finder_large(p, 3);
+		stats.totalThrees = results.sum();
+	}
+
+	if (puzzleDimension >= 4)
+	{
+		conts_for_single_config(p, 4, &stats.fours);
+		results = cont_finder_large(p, 4);
+		stats.totalFours = results.sum();
+	}
+
+	return stats;
+}
+
+PartialStats partial_finder(Puzzle& p)
+{
+	PartialStats stats = { 0 };
+	PuzzleStats results = { 0 };
+	int puzzleDimension = p.get_puzzle_size();
+
+	if (puzzleDimension >= 2)
+	{
+		conts_for_single_config(p, 2, &stats.twos);
+		results = cont_finder(p, 2);
+		stats.totalTwos = results.sum();
+	}
+
+	if (puzzleDimension >= 3)
+	{
+		conts_for_single_config(p, 3, &stats.threes);
+		results = cont_finder(p, 3);
+		stats.totalThrees = results.sum();
+	}
+
+	if (puzzleDimension >= 4)
+	{
+		conts_for_single_config(p, 4, &stats.fours);
+		results = cont_finder(p, 4);
+		stats.totalFours = results.sum();
+	}
+
+	return stats;
+}
+
+/* MENU OPTIONS */
+
+void manual_puzzle(int puzzleSize)
+{
+	bool acceptedPuzzle = false; 
+
+	int noOfNonBlanks = (puzzleSize * puzzleSize) - 1;
+	int minBlockValue = 1;
+	int maxBlockValue = noOfNonBlanks + 5;
+
+	while (!acceptedPuzzle)
+	{
+		cout << "Enter the numbers for the puzzle between 1 and " << maxBlockValue << " inclusive. Positions go from left to right, then down to the next row.\nBlank must be in bottom right.\n";
+		int value = 0;
+		vector<int> blocks;
+		bool used;
+		fifteen_file.switch_mode(WRITE);
+
+		for (int i = 0; i < noOfNonBlanks; i++)
+		{
+			used = true;
+			while (used)
+			{
+				cin >> value;
+				if (cin.fail())
+				{
+					cout << "Input must be a number!\n";
+					cin.clear();
+					cin.ignore(256, '\n');
+				}
+				else if (std::find(blocks.begin(), blocks.end(), value) != blocks.end()) {
+					cout << "Number already used!\n";
+				}
+				else if (value < minBlockValue || value > maxBlockValue)
+					cout << "Number out of range!\n";
+				else
+				{
+					blocks.push_back(value);
+					used = false;
+				}
+			}
+		}
+
+		Puzzle p(&blocks[0], puzzleSize);
+		cout << "Your entered puzzle: \n" << p;
+		cout << "Is this okay? (y/n): ";
+		char choice;
+		cin >> choice;
+		if (tolower(choice) == 'y')
+		{
+			acceptedPuzzle = true;
+			fifteen_file.write(1);
+			fifteen_file.write(p);
+			cout << "Printed to the 15 file\n";
+		}
+
+		cin.clear();
+		cin.ignore(256, '\n');
+			
+	}	
+}
+
+void random_puzzles(int puzzleSize)
+{
+	buf.str("");
+	buf.clear();
+	fifteen_file.switch_mode(WRITE);
+
+	int noOfConfigs;
+	
+	validate_is_int(noOfConfigs, "Enter the number of random configurations to generate: ");
+
+	fifteen_file.write(noOfConfigs);
+	auto start = std::chrono::high_resolution_clock::now();
+	int noOfNonBlanks = (puzzleSize * puzzleSize) - 1;
+	int maxBlockValue = noOfNonBlanks + 5;
+	vector<int> validNumbers(maxBlockValue);
+	iota(validNumbers.begin(), validNumbers.end(), 1);
+
+	Puzzle p(puzzleSize);
+
+	for (int i = 0; i < noOfConfigs; i++)
+	{
+		shuffle(validNumbers.begin(), validNumbers.end(),rng);
+		p.set_all_blocks(&validNumbers[0]);
+
+		buf << p;
+
+		if (i % 1000 == 0 && i > 0)
+			cout << '.';
+	}
+	
+	fifteen_file.write(buf.rdbuf()->str());
+	auto finish = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> elapsed = finish - start;
+	cout << "\nConfigurations generated in the 15-file in " << elapsed.count() << "\n";
+}
+
+void threaded_random_puzzle(vector<int>& validNumbers, int puzzleSize, int noOfConfigs)
+{
+	Puzzle p(puzzleSize);
+
+	for (int i = 0; i < noOfConfigs; i++)
+	{
+		shuffle(validNumbers.begin(), validNumbers.end(), rng);
+		p.set_all_blocks(&validNumbers[0]);
+
+		lock_guard<mutex> guard(bufMutex);
+		buf << p;
+	}
+}
+
+
+void random_puzzles_threaded(int puzzleSize)
+{
+	buf.str("");
+	buf.clear();
+	fifteen_file.switch_mode(WRITE);
+
+	int noOfConfigs;
+
+	validate_is_int(noOfConfigs, "Enter the number of random configurations to generate: ");
+
+	fifteen_file.write(noOfConfigs);
+	
+	int noOfNonBlanks = (puzzleSize * puzzleSize) - 1;
+	int maxBlockValue = noOfNonBlanks + 5;
+	vector<int> validNumbers(maxBlockValue);
+	iota(validNumbers.begin(), validNumbers.end(), 1);
+
+	// Thread pool to prevent creating a thread per puzzle to generate and allow them to be reused if needed. 
+	// Each thread takes a share of the number of configs and generates that number of puzzles.
+	ctpl::thread_pool pool(thread::hardware_concurrency());
+	std::vector<std::future<void>> results(noOfConfigs);
+
+	int	wholeNoOfThreads = noOfConfigs / thread::hardware_concurrency();
+	int remainingThreads = noOfConfigs % thread::hardware_concurrency();
+	std::chrono::time_point<std::chrono::high_resolution_clock> start;
+	if (wholeNoOfThreads > 0)
+	{
+		for (int i = 0; i < thread::hardware_concurrency(); i++)
+		{
+			results[i] = pool.push([&](int) { threaded_random_puzzle(validNumbers, puzzleSize, wholeNoOfThreads); });
+		}
+		results.emplace_back(pool.push([&](int) { threaded_random_puzzle(validNumbers, puzzleSize, remainingThreads); }));
+
+		start = std::chrono::high_resolution_clock::now();
+		for (vector<std::future<void>>::iterator it = results.begin(); it != results.end(); ++it)
+		{
+			if ((*it).valid())
+				(*it).get();
+		}
+	}
+	else
+	{
+		results.back() = pool.push([&](int) { threaded_random_puzzle(validNumbers, puzzleSize, remainingThreads); });
+		start = std::chrono::high_resolution_clock::now();
+		for (vector<std::future<void>>::iterator it = results.begin(); it != results.end(); ++it)
+		{
+			if ((*it).valid())
+				(*it).get();
+		}
+	}
+	
+	fifteen_file.write(buf.rdbuf()->str());
+	std::chrono::time_point<std::chrono::high_resolution_clock> finish = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> elapsed = finish - start;
+	cout << "\nRandom configurations generated in 15 file in " << elapsed.count() << " seconds\n";
+}
+
+
+
+void read_15_file(bool findPartials)
+{
+	buf.str("");
+	buf.clear();
+	fifteen_file.switch_mode(READ);
+	int noOfConfigs;
+
+	try
+	{
+		fifteen_file.read_int(noOfConfigs);
+
+		if (noOfConfigs > 0)
+		{
+			buf << noOfConfigs << "\n";
+
+			vector<int> blocks;
+			string line;
+
+			int value;
+			int lineCounter;
+			fifteen_file.read_line(line); // skip the number of configs at the top
+
+			for (int configCount = 0; configCount < noOfConfigs; configCount++)
+			{
+				// Determine the size of the puzzle as it's read in by counting how many lines are found. 
+				lineCounter = 0;
+
+				fifteen_file.read_line(line);
+				if (line.empty())
+					throw invalid_argument("No actual puzzles in file");
+
+				while (!line.empty())
+				{
+					validate_line_format(line);
+					istringstream ss(line);
+					while (ss >> value)
+						blocks.push_back(value);
+					lineCounter++;
+					fifteen_file.read_line(line);
+				}
+
+				blocks.push_back(0);
+
+				Puzzle p(&blocks[0], lineCounter);
+				buf << p;
+						
+				// Use bigints only when necessary to save memory!
+				if (p.get_puzzle_size() <= 4)
+				{
+					buf << cont_finder(p, p.get_puzzle_size());
+					if (findPartials)
+						buf << partial_finder(p);
+				}
+				else
+				{
+					buf << cont_finder_large(p, p.get_puzzle_size());
+
+					if (findPartials)
+						buf << partial_finder_large(p);
+				}
+
+				blocks.clear();
+
+				if (configCount % 1000 == 0 && configCount > 0)
+					cout << '.';
+
+			}
+
+			solution_file.switch_mode(WRITE);
+			solution_file.write(buf.rdbuf()->str());
+			cout << "\nSolution file generated\n";
+		}
+		else
+		{
+			cout << "No puzzles registered in this file to read!\n";
+		}
+
+		
+	}
+	catch (const invalid_argument& iae)
+	{
+		cout << "Unable to read data: " << iae.what() << "\n";
+	}
+}
+
+
+bool display_menu()
+{
+	bool exitAfter = false;
+	cout << "Type your chosen option\n";
+	cout << "1. Manual Puzzle Creation\n";
+	cout << "2. Random Puzzle Creation\n";
+	cout << "3: Read In 15 File\n";
+	cout << "4: Exit Program\n";
+
+	int choice;
+	cin >> choice;
+
+	bool validSize = false;
+	int puzzleSize;
+	switch (choice)
+	{
+	case 1:
+		validate_is_int(puzzleSize, "Enter the puzzle dimension n to use (n x n): ");
+		manual_puzzle(puzzleSize);
+		break;
+	case 2:
+	{
+		validate_is_int(puzzleSize, "Enter the puzzle dimension n to use (n x n): ");
+		char threadChoice;
+		cout << "Use threading? (y/n): ";
+		cin >> threadChoice;
+		tolower(threadChoice) == 'y' ? random_puzzles_threaded(puzzleSize) : random_puzzles(puzzleSize);
+		break;
+	}
+	case 3:
+		cout << "Find 2/3/4 partials for puzzles where size appropriate? (y/n): ";
+		char partialChoice;
+		cin >> partialChoice;
+		read_15_file(tolower(partialChoice) == 'y');
+		break;
+	case 4:
+		cout << "Exiting\n";
+		exitAfter = true;
+		break;
+	default:
+		cout << "Not a valid menu choice!\n";
+		break;
+	}
+	
+	return exitAfter;
+}
+
+int main()
+{
+	rng.seed(std::chrono::system_clock::now().time_since_epoch().count());
+
+	set_file_names();
+
+	fifteen_file.open();
+	solution_file.open();
+	bool exit = false;
+
+	while (!exit)
+	{
+		if (display_menu())
+			break;
+
+		cout << "Press 1 to return to the menu, any other key to quit.\n";
+		int choice;
+		cin >> choice;
+		if (choice != 1)
+			exit = true;
+	}
+
+	fifteen_file.close();
+	solution_file.close();
+	return 0;
+}
+
+
